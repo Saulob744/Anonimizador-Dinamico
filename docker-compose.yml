@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  # ============================================================
+  # 🧠 SERVIÇO DE IA LOCAL ON-PREMISE (Ollama)
+  # ============================================================
+  ollama:
+    image: ollama/ollama:latest
+    container_name: anonimizador_ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_storage:/root/.ollama
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-127.0.0.1,localhost,ollama,app}
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list > /dev/null 2>&1 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 15s
+
+  # ============================================================
+  # ⬇️ DOWNLOAD AUTOMÁTICO DO MODELO ESPECÍFICO LEVE (llama3.2:1b)
+  # Executa uma única vez para garantir o modelo pronto
+  # ============================================================
+  ollama-init:
+    image: ollama/ollama:latest
+    container_name: anonimizador_ollama_init
+    restart: "no"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+    entrypoint: 
+      - "sh"
+      - "-c"
+      - |
+        echo "⏳ Verificando/Baixando modelo específico: $${OLLAMA_MODEL:-llama3.2:1b}..."
+        ollama pull $${OLLAMA_MODEL:-llama3.2:1b}
+        echo "✅ Modelo pronto para inferência!"
+
+  # ============================================================
+  # 🛡️ APLICAÇÃO PRINCIPAL (Streamlit + Pipeline de Proteção)
+  # ============================================================
+  app:
+    build:
+      context: .
+      dockerfile: dockerfile
+    container_name: anonimizador_app
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      - OLLAMA_URL=http://ollama:11434/api/generate
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.2:1b}
+      - ANONYMIZER_SECRET_SALT=${ANONYMIZER_SECRET_SALT:-SaltSeguroSESP2026_Homologacao!}
+      - DB_SOURCE=${DB_SOURCE:-}
+      - DB_TARGET=${DB_TARGET:-}
+      - CHUNK_SIZE_DB=${CHUNK_SIZE_DB:-9000}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+    volumes:
+      - ./relatorios:/app/relatorios
+    extra_hosts:
+      # Permite conectar ao banco local da máquina host usando 'host.docker.internal'
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  ollama_storage:
+    driver: local

@@ -119,8 +119,11 @@ def get_user_schemas(engine):
 
 def copy_schema(src_engine, dst_engine, schema):
     if get_db_type(dst_engine) == "postgresql":
-        with dst_engine.begin() as conn:
-            conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        try:
+            with dst_engine.begin() as conn:
+                conn.execute(text(f'CREATE SCHEMA IF NOT EXISTS "{schema}"'))
+        except Exception as e:
+            logger.warning(f"⚠️ CREATE SCHEMA aviso ({schema}): {e}")
 
     meta = sa.MetaData()
     with src_engine.connect() as conn:
@@ -136,9 +139,39 @@ def copy_schema(src_engine, dst_engine, schema):
                 logger.warning(f"CREATE SKIP {schema}.{table.name}: {e}")
 
 # ==================================================
-# LEITURA E ESCRITA
+# LEITURA SEQUENCIAL E CURSOR (KEYSET PAGINATION)
 # ==================================================
-def fetch_rows_streaming(engine, table, schema, chunk_size=10000, order_by_column=None, max_limit=None, order_direction="DESC"):
+def detect_cursor_strategy(engine, table, schema, requested_col=None):
+    key = f"{schema}.{table}"
+    if key not in _TABLE_CACHE:
+        _TABLE_CACHE[key] = sa.Table(table, sa.MetaData(), autoload_with=engine, schema=schema)
+    t_ref = _TABLE_CACHE[key]
+
+    insp = inspect(engine)
+    pks = []
+    try:
+        pks = insp.get_pk_constraint(table, schema=schema).get("constrained_columns", [])
+    except Exception:
+        pass
+    pk_col = pks[0] if pks and pks[0] in t_ref.columns else None
+
+    if requested_col and requested_col in t_ref.columns:
+        if pk_col and pk_col != requested_col:
+            return requested_col, pk_col, "COMPOSITE"
+        return requested_col, pk_col, "SINGLE_CURSOR"
+
+    if pk_col:
+        return pk_col, pk_col, "PK_DIRECT"
+
+    col_names = [c.name for c in t_ref.columns]
+    for candidate in ["id", "codigo", "cod", "created_at", "data_registro", "data_criacao", "dt_cadastro", "data", "dt_registro"]:
+        for c in col_names:
+            if c.lower() == candidate:
+                return c, None, "SINGLE_CURSOR"
+
+    return None, None, "OFFSET_FALLBACK"
+
+def fetch_rows_streaming(engine, table, schema, chunk_size=9000, order_by_column=None, max_limit=None, order_direction="ASC", pause_between_chunks=0.0):
     key = f"{schema}.{table}"
     
     if key not in _TABLE_CACHE:
@@ -152,16 +185,15 @@ def fetch_rows_streaming(engine, table, schema, chunk_size=10000, order_by_colum
         else:
             select_cols.append(col)
 
-    base_query = sa.select(*select_cols)
+    cursor_col_name, pk_col_name, strategy = detect_cursor_strategy(engine, table, schema, order_by_column)
+    is_desc = (order_direction == "DESC")
     
-    if order_by_column and order_by_column in t_ref.columns:
-        if order_direction == "DESC":
-            base_query = base_query.order_by(t_ref.columns[order_by_column].desc())
-        else:
-            base_query = base_query.order_by(t_ref.columns[order_by_column].asc())
+    logger.info(f"🔍 [PAGINAÇÃO SEQUENCIAL] {schema}.{table} | Estratégia: {strategy} | Cursor: {cursor_col_name} (PK: {pk_col_name}) | Lote: {chunk_size} | Direção: {order_direction}")
 
-    offset = 0
     total_yielded = 0
+    last_cursor_val = None
+    last_pk_val = None
+    offset = 0
 
     while True:
         current_limit = chunk_size
@@ -170,7 +202,29 @@ def fetch_rows_streaming(engine, table, schema, chunk_size=10000, order_by_colum
             if current_limit <= 0:
                 break
 
-        query = base_query.limit(current_limit).offset(offset)
+        query = sa.select(*select_cols)
+
+        if strategy == "COMPOSITE":
+            c_col = t_ref.columns[cursor_col_name]
+            p_col = t_ref.columns[pk_col_name]
+            if last_cursor_val is not None and last_pk_val is not None:
+                if is_desc:
+                    cond = sa.or_(c_col < last_cursor_val, sa.and_(c_col == last_cursor_val, p_col < last_pk_val))
+                else:
+                    cond = sa.or_(c_col > last_cursor_val, sa.and_(c_col == last_cursor_val, p_col > last_pk_val))
+                query = query.where(cond)
+            query = query.order_by(c_col.desc() if is_desc else c_col.asc(), p_col.desc() if is_desc else p_col.asc()).limit(current_limit)
+
+        elif strategy in ["PK_DIRECT", "SINGLE_CURSOR"]:
+            c_col = t_ref.columns[cursor_col_name]
+            if last_cursor_val is not None:
+                query = query.where(c_col < last_cursor_val if is_desc else c_col > last_cursor_val)
+            query = query.order_by(c_col.desc() if is_desc else c_col.asc()).limit(current_limit)
+
+        else: # OFFSET_FALLBACK
+            if order_by_column and order_by_column in t_ref.columns:
+                query = query.order_by(t_ref.columns[order_by_column].desc() if is_desc else t_ref.columns[order_by_column].asc())
+            query = query.limit(current_limit).offset(offset)
 
         with engine.connect() as conn:
             rows = conn.execute(query).mappings().fetchall()
@@ -178,6 +232,13 @@ def fetch_rows_streaming(engine, table, schema, chunk_size=10000, order_by_colum
         if not rows:
             break
             
+        # Atualiza o ponto onde a consulta parou
+        last_record = rows[-1]
+        if cursor_col_name and cursor_col_name in last_record:
+            last_cursor_val = last_record[cursor_col_name]
+        if pk_col_name and pk_col_name in last_record:
+            last_pk_val = last_record[pk_col_name]
+
         yield rows
         
         offset += len(rows)
@@ -185,6 +246,13 @@ def fetch_rows_streaming(engine, table, schema, chunk_size=10000, order_by_colum
         
         if max_limit and total_yielded >= max_limit:
             break
+
+        # Se retornou menos que o lote solicitado, significa que a tabela terminou
+        if len(rows) < current_limit:
+            break
+
+        if pause_between_chunks > 0:
+            time.sleep(pause_between_chunks)
 
 def insert_rows(engine, table_name, schema, rows, max_retries=3):
     if not rows: return
@@ -279,5 +347,8 @@ def build_dependency_graph(engine, tables, schema):
 
 def set_replication_role(engine, role='replica'):
     if get_db_type(engine) == "postgresql":
-        with engine.begin() as conn:
-            conn.execute(text(f"SET session_replication_role = '{role}'"))
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(f"SET session_replication_role = '{role}'"))
+        except Exception as e:
+            logger.warning(f"⚠️ Aviso: Não foi possível aplicar session_replication_role='{role}' (requer privilégios de superusuário/replicação): {e}")

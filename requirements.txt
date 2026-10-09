@@ -30,3 +30,4 @@ requests>=2.31.0
 # 🧠 Motor de Anonimização Híbrida
 # ==========================================
 faker>=24.0.0
+spacy>=3.7.0

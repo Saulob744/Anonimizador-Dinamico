@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 SECRET_SALT = os.getenv("ANONYMIZER_SECRET_SALT", "SaltSeguroSESP2026_Producao!")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3:latest")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 ABORT_FILE = "abort.flag"
 
 # Telemetria Global
@@ -101,9 +101,25 @@ def _ask_llm_yes_no(prompt: str, cache_key: str, system_prompt: str = "") -> boo
     if cache_key in _OLLAMA_CACHE: return _OLLAMA_CACHE[cache_key]
     if len(_OLLAMA_CACHE) >= MAX_CACHE_SIZE: _OLLAMA_CACHE.clear() 
     try:
-        resp = http_session.post(OLLAMA_URL, json={"model": OLLAMA_MODEL, "system": system_prompt, "prompt": _sanitize_input(prompt), "stream": False, "options": {"temperature": 0.0, "top_p": 0.1, "top_k": 1, "num_predict": 5}}, timeout=(5, 20))
+        resp = http_session.post(
+            OLLAMA_URL, 
+            json={
+                "model": OLLAMA_MODEL, 
+                "system": system_prompt, 
+                "prompt": _sanitize_input(prompt), 
+                "stream": False, 
+                "options": {
+                    "temperature": 0.0, 
+                    "top_p": 0.1, 
+                    "top_k": 1, 
+                    "num_predict": 5
+                }
+            }, 
+            timeout=(5, 20)
+        )
         if resp.status_code == 200:
-            is_yes = bool(re.search(r'\bSIM\b', resp.json().get("response", "").strip().upper()))
+            resp_txt = resp.json().get("response", "").strip().upper()
+            is_yes = bool(re.search(r'\bSIM\b', resp_txt)) and not bool(re.search(r'\bN[AÃ]O\b', resp_txt))
             _OLLAMA_CACHE[cache_key] = is_yes
             return is_yes
     except Exception as e: logger.warning(f"Falha LLM [{cache_key}]: {e}")
@@ -111,8 +127,18 @@ def _ask_llm_yes_no(prompt: str, cache_key: str, system_prompt: str = "") -> boo
 
 def _ask_llm_batch(candidates: list) -> list:
     if not candidates: return []
-    instrucao_mestra = "Valide se o fragmento é EXCLUSIVAMENTE nome próprio humano. Rejeite locais, verbos e cargos. Responda 'SIM' ou 'NAO'."
-    return [c for c in set(candidates) if not _check_abort() and len((c_clean := _sanitize_input(c.strip())).split()) >= 2 and not STOP_WORDS_NAME.search(c_clean) and _ask_llm_yes_no(f"Termo: '{c_clean}'\nResposta:", f"PER:{c_clean.upper()}", system_prompt=instrucao_mestra)]
+    instrucao_mestra = (
+        "Validador estrito de nomes humanos em português. "
+        "Responda estritamente 'SIM' se o fragmento for EXCLUSIVAMENTE um nome próprio de pessoa. "
+        "Responda 'NAO' se for local, rua, órgão público, cargo, verbo ou objeto."
+    )
+    return [
+        c for c in set(candidates) 
+        if not _check_abort() 
+        and len((c_clean := _sanitize_input(c.strip())).split()) >= 2 
+        and not STOP_WORDS_NAME.search(c_clean) 
+        and _ask_llm_yes_no(f"O fragmento '{c_clean}' é nome de pessoa? Responda SIM ou NAO:", f"PER:{c_clean.upper()}", system_prompt=instrucao_mestra)
+    ]
 
 class AegisClassifier:
     FAST_TRACK_MAP = {"CPF": "CPF", "RG": "RG", "CEP": "CEP", "PLATE": "PLACA", "EMAIL": "EMAIL", "PHONE": "PHONE", "CHASSI": "CHASSI", "IP": "IP", "COORD": "COORD", "COORD_SINGLE": "COORD_SINGLE", "TEXTO_LIVRE": "TEXTO_LIVRE", "NOME_SOLTO": "NOME_SOLTO", "DATE_TIME": "IGNORAR", "GENERIC_CODE": "GENERIC_CODE"}

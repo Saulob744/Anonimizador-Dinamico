@@ -128,7 +128,7 @@ def build_url(db_type, config_dict):
         url = f"mysql+pymysql://{urllib.parse.quote_plus(user)}:{urllib.parse.quote_plus(password)}@{host}:{port}/{db}?charset=utf8mb4"
     return url
 
-def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, max_limit, order_by_col_pref, order_direction, modo, regras_mascara, target_cols):
+def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, max_limit, order_by_col_pref, order_direction, modo, regras_mascara, target_cols, pause_between_chunks=0.0):
     t0_global = time.time()
     clear_abort()
     try:
@@ -172,7 +172,7 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
                 col_ordem = None if order_by_col_pref == "Nenhuma" else order_by_col_pref
                 dir_ordem = "DESC" if "DESC" in order_direction else "ASC"
                 
-                for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size, order_by_column=col_ordem, max_limit=limit_val, order_direction=dir_ordem):
+                for chunk in db_utils.fetch_rows_streaming(src_engine, t, s, chunk_size, order_by_column=col_ordem, max_limit=limit_val, order_direction=dir_ordem, pause_between_chunks=pause_between_chunks):
                     chunk_start = time.time()
                     rows = [dict(r) for r in chunk]
 
@@ -410,15 +410,32 @@ with st.sidebar:
     if st.session_state.view_mode == "Bancos de Dados":
         st.markdown("#### Configuração Conexão")
         db_type = st.selectbox("Motor", ["postgresql", "mysql", "mssql"])
-        ab_o, ab_d = st.tabs(["Origem", "Destino"])
+        ab_o, ab_d = st.tabs(["Origem (Restrito / Leitura)", "Destino (Local / Livre)"])
+
+        def get_default_db_config(prefix):
+            env_url = os.getenv("DB_SOURCE" if prefix == "origem" else "DB_TARGET")
+            cfg = {"host": "localhost", "port": "", "db": "", "user": "", "password": ""}
+            if env_url:
+                try:
+                    clean = env_url.split("://")[-1] if "://" in env_url else env_url
+                    p = urllib.parse.urlparse(f"dummy://{clean}")
+                    if p.hostname: cfg["host"] = p.hostname
+                    if p.port: cfg["port"] = str(p.port)
+                    if p.path: cfg["db"] = p.path.lstrip("/")
+                    if p.username: cfg["user"] = p.username
+                    if p.password: cfg["password"] = p.password
+                except Exception:
+                    pass
+            return cfg
 
         def render_db_form(prefix):
+            defaults = get_default_db_config(prefix)
             return {
-                "host": st.text_input("Host", value="localhost", key=f"{prefix}_host"),
-                "port": st.text_input("Porta", key=f"{prefix}_port"),
-                "db": st.text_input("Banco", key=f"{prefix}_db"),
-                "user": st.text_input("Usuário", key=f"{prefix}_user"),
-                "password": st.text_input("Senha", type="password", key=f"{prefix}_pass")
+                "host": st.text_input("Host", value=defaults["host"], key=f"{prefix}_host"),
+                "port": st.text_input("Porta", value=defaults["port"], key=f"{prefix}_port"),
+                "db": st.text_input("Banco", value=defaults["db"], key=f"{prefix}_db"),
+                "user": st.text_input("Usuário", value=defaults["user"], key=f"{prefix}_user"),
+                "password": st.text_input("Senha", value=defaults["password"], type="password", key=f"{prefix}_pass")
             }
 
         with ab_o: src_cfg = render_db_form("origem")
@@ -426,7 +443,21 @@ with st.sidebar:
 
         st.markdown("#### Parâmetros de Motor")
         modo = st.selectbox("Modo BD", ["🛡️ Anonimização Total", "⚡ Cópia Direta"])
-        chunk_size_db = st.number_input("Lote DB (Rows)", value=1000, step=1000) 
+        chunk_size_db = st.number_input(
+            "Lote Sequencial DB (Rows)", 
+            value=int(os.getenv("CHUNK_SIZE_DB", 9000)), 
+            step=1000, 
+            max_value=9500, 
+            help="Tamanho do lote sequencial. Configurado em 9.000 para não estourar o limite de 10.000 linhas de bancos de dados restritos."
+        )
+        pause_db = st.slider(
+            "Pausa entre Consultas (segundos)", 
+            min_value=0.0, 
+            max_value=5.0, 
+            value=0.0, 
+            step=0.5, 
+            help="Tempo de espera entre requisições sequenciais (útil caso o banco externo limite a taxa de requisições)."
+        )
         filter_tables = st.text_input("Filtrar tabelas (vírgula)")
         super_proc_db = st.toggle("🚀 Multi CPU BD", value=False)
         n_cores_db = st.slider("CPU BD", 1, psutil.cpu_count(logical=True), psutil.cpu_count(logical=True)) if super_proc_db else 1
@@ -481,7 +512,7 @@ with st.sidebar:
             with col_dir:
                 direcao_ordenacao = st.selectbox(
                     "Direção da Leitura",
-                    options=["Mais Recentes Primeiro (DESC)", "Mais Antigos Primeiro (ASC)"]
+                    options=["Mais Antigos Primeiro (ASC)", "Mais Recentes Primeiro (DESC)"]
                 )
             
             st.markdown("#### Mapeamento de Exceções")
@@ -493,6 +524,7 @@ with st.sidebar:
                 st.session_state.limite_linhas_db = limite_linhas_db
                 st.session_state.coluna_ordenacao = coluna_ordenacao
                 st.session_state.direcao_ordenacao = direcao_ordenacao
+                st.session_state.pause_db = pause_db
 
     elif st.session_state.view_mode == "Arquivos (.pdf, .csv, .txt)":
         st.markdown("#### Parâmetros de Motor (Arquivos)")
@@ -511,7 +543,8 @@ if st.session_state.view_mode == "Bancos de Dados":
             args=(
                 db_type, src_cfg, dst_cfg, filter_tables, n_cores_db, chunk_size_db, 
                 st.session_state.limite_linhas_db, st.session_state.coluna_ordenacao, st.session_state.direcao_ordenacao,
-                modo, dicionario_regras, st.session_state.colunas_selecionadas_finais
+                modo, dicionario_regras, st.session_state.colunas_selecionadas_finais,
+                st.session_state.get("pause_db", 0.0)
             ), 
             daemon=True
         ).start()
