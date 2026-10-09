@@ -37,12 +37,13 @@ if "CACHE_RESULTADOS_ARQUIVOS" not in st.session_state:
 if "file_process_started" not in st.session_state:
     st.session_state.file_process_started = False
 
-def save_progress(arquivo_alvo, fase, t_atual, t_total, l_atual, l_total, velocidade, tempo, finalizado=False, politicas=None):
+def save_progress(arquivo_alvo, fase, t_atual, t_total, l_atual, l_total, velocidade, tempo, finalizado=False, politicas=None, relatorio_performance=None):
     data = {
         "fase": fase, "tabelas_processadas": t_atual, "tabelas_total": t_total,
         "linhas_processadas": l_atual, "linhas_total": l_total,
         "velocidade": velocidade, "tempo_decorrido": tempo, "finalizado": finalizado,
-        "politicas": politicas or {}
+        "politicas": politicas or {},
+        "relatorio_performance": relatorio_performance
     }
     try:
         with open(arquivo_alvo, "w", encoding="utf-8") as f:
@@ -60,6 +61,82 @@ def load_progress(arquivo_alvo):
                 time.sleep(0.1)
     return None
 
+def render_painel_relatorio_performance(relatorio, titulo="📊 Avaliação de Performance e Capacidade da Anonimização"):
+    if not relatorio:
+        return
+        
+    st.markdown("---")
+    st.markdown(f"### {titulo}")
+    
+    meta = relatorio.get("metadados", {})
+    perf = relatorio.get("metricas_performance", {})
+    resumo = relatorio.get("resumo_rapido", {})
+    entidades = relatorio.get("entidades_detalhadas", {})
+    
+    # 4 colunas principais de alto nível
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric(
+            label="⚡ Velocidade Média",
+            value=f"{perf.get('itens_por_segundo', 0):,.1f} itens/s",
+            help="Taxa de transferência: total de itens ou células avaliadas por segundo."
+        )
+    with col2:
+        st.metric(
+            label="⏱️ Tempo Total",
+            value=meta.get("tempo_formatado", "0s"),
+            help=f"Duração cronometrada: {meta.get('tempo_total_segundos', 0)}s."
+        )
+    with col3:
+        st.metric(
+            label="🛡️ Dados Mascarados",
+            value=f"{perf.get('substituicoes_totais', 0):,}",
+            help=f"Total de transformações sensíveis aplicadas (Taxa de sensibilidade da base: {perf.get('taxa_sensibilidade_pct', 0)}%)."
+        )
+    with col4:
+        st.metric(
+            label="👥 Pessoas Protegidas",
+            value=f"{resumo.get('pessoas_unicas', 0):,} únicas",
+            delta=f"{resumo.get('total_pessoas_protegidas', 0)} ocorrências",
+            delta_color="off",
+            help="Total de identidades de pessoas e nomes próprios identificados e mascarados."
+        )
+
+    # Detalhamento de Entidades Capturadas
+    if entidades:
+        st.markdown("#### 🔍 Mapeamento Granular de Dados Sensíveis Capturados")
+        dados_tabela = []
+        for cat, dados in entidades.items():
+            dados_tabela.append({
+                "Categoria Sensível": dados.get("label", cat),
+                "Ocorrências Substituídas": f"{dados.get('total_capturado', 0):,}",
+                "Registros Únicos Distintos": f"{dados.get('unicos_distintos', 0):,}"
+            })
+        
+        df_entidades = pd.DataFrame(dados_tabela)
+        st.dataframe(df_entidades, use_container_width=True, hide_index=True)
+        
+    # Informações de Auditoria e Botão de Download
+    arq_path = relatorio.get("arquivo_gerado")
+    c_btn, c_info = st.columns([1, 2])
+    with c_btn:
+        rel_json_bytes = json.dumps(relatorio, indent=4, ensure_ascii=False).encode("utf-8")
+        nome_download = os.path.basename(arq_path) if arq_path else "relatorio_auditoria_performance.json"
+        st.download_button(
+            label="📥 Baixar Relatório de Auditoria (.JSON)",
+            data=rel_json_bytes,
+            file_name=nome_download,
+            mime="application/json",
+            type="primary",
+            use_container_width=True
+        )
+    with c_info:
+        if arq_path:
+            st.caption(f"📁 **Arquivo Gerado no Servidor:** `{arq_path}`\n\n*(Modelo IA: `{meta.get('modelo_ia', 'N/A')}` | Contexto: `{meta.get('contexto', 'Geral')}`)*")
+            
+    with st.expander("📄 Ver Estrutura Técnica Completa do Relatório (Auditoria DLP / LGPD)", expanded=False):
+        st.json(relatorio)
+
 def clear_abort():
     if os.path.exists(ABORT_FILE):
         try: os.remove(ABORT_FILE)
@@ -73,7 +150,7 @@ def limpar_sessao():
         if os.path.exists(f):
             try: os.remove(f)
             except Exception: pass
-    for key in ["analise_concluida", "todas_colunas_disponiveis", "colunas_selecionadas_finais", "CACHE_RESULTADOS_ARQUIVOS", "file_process_started", "colunas_ordenaveis", "limite_linhas_db", "coluna_ordenacao", "direcao_ordenacao"]:
+    for key in ["analise_concluida", "todas_colunas_disponiveis", "colunas_selecionadas_finais", "CACHE_RESULTADOS_ARQUIVOS", "file_process_started", "colunas_ordenaveis", "limite_linhas_db", "coluna_ordenacao", "direcao_ordenacao", "texto_anonimizado_resultado", "relatorio_texto_livre"]:
         if key in st.session_state:
             del st.session_state[key]
 
@@ -131,6 +208,7 @@ def build_url(db_type, config_dict):
 def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, chunk_size, max_limit, order_by_col_pref, order_direction, modo, regras_mascara, target_cols, pause_between_chunks=0.0):
     t0_global = time.time()
     clear_abort()
+    anonymizer.resetar_telemetria()
     try:
         save_progress(STATUS_FILE, "Conectando aos bancos de dados...", 0, 0, 0, 0, 0, 0)
         src_engine = db_utils.connect(build_url(db_type, src_cfg))
@@ -226,7 +304,8 @@ def run_pipeline_background(db_type, src_cfg, dst_cfg, filter_tables, n_cores, c
                         last_json_update = now
 
         db_utils.set_replication_role(dst_engine, "origin")
-        save_progress(STATUS_FILE, "Concluído", processed_tables, total_tables, total_rows, total_estimated, 0, time.time() - t0_global, finalizado=True)
+        relatorio = anonymizer.gerar_relatorio_performance(salvar_arquivo=True, contexto="Banco de Dados")
+        save_progress(STATUS_FILE, "Concluído", processed_tables, total_tables, total_rows, total_estimated, 0, time.time() - t0_global, finalizado=True, politicas=anonymizer._COLUMN_POLICIES, relatorio_performance=relatorio)
 
     except Exception as e:
         save_progress(STATUS_FILE, f"Erro Fatal: {e}", 0, 0, 0, 0, 0, 0, finalizado=True)
@@ -236,6 +315,7 @@ def run_files_pipeline_background(arquivos_payload, formato_saida, regras_mascar
     total_arquivos = len(arquivos_payload)
     arquivos_prontos = []
     clear_abort()
+    anonymizer.resetar_telemetria()
     
     try:
         save_progress(FILE_STATUS_FILE, "Iniciando Esteira de Arquivos...", 0, total_arquivos, 0, 100, 0, 0, False)
@@ -361,7 +441,8 @@ def run_files_pipeline_background(arquivos_payload, formato_saida, regras_mascar
             with open("resultado_lote.zip", "wb") as f:
                 f.write(zip_buffer.getvalue())
 
-        save_progress(FILE_STATUS_FILE, "Concluído", total_arquivos, total_arquivos, 100, 100, 0, time.time() - t0_global, finalizado=True)
+        relatorio = anonymizer.gerar_relatorio_performance(salvar_arquivo=True, contexto="Arquivos")
+        save_progress(FILE_STATUS_FILE, "Concluído", total_arquivos, total_arquivos, 100, 100, 0, time.time() - t0_global, finalizado=True, relatorio_performance=relatorio)
 
     except Exception as e:
         logger.error(f"Erro Arquivos Background: {e}", exc_info=True)
@@ -590,7 +671,10 @@ if st.session_state.view_mode == "Bancos de Dados":
         else:
             if "Abortado" in estado_atual.get("fase", ""): st.warning("⚠️ Operação Interrompida com Sucesso e Sem Corromper a Base.")
             elif "Erro" in estado_atual.get("fase", ""): st.error(f"🚨 Falha no Banco: {estado_atual['fase']}")
-            else: st.success("✅ Cópia e Mascaramento de Banco de Dados Concluídos com Sucesso!")
+            else: 
+                st.success("✅ Cópia e Mascaramento de Banco de Dados Concluídos com Sucesso!")
+                if estado_atual.get("relatorio_performance"):
+                    render_painel_relatorio_performance(estado_atual["relatorio_performance"], "📊 Relatório de Performance e Auditoria (Banco de Dados)")
             if st.button("Limpar Histórico de Banco"): limpar_sessao(); st.rerun()
     else:
         st.info("Configure a conexão no menu lateral para iniciar a análise.")
@@ -695,6 +779,9 @@ elif st.session_state.view_mode == "Arquivos (.pdf, .csv, .txt)":
                             type="primary",
                             use_container_width=True
                         )
+                    
+                    if estado_arquivos.get("relatorio_performance"):
+                        render_painel_relatorio_performance(estado_arquivos["relatorio_performance"], "📊 Relatório de Performance e Auditoria (Arquivos)")
                 
                 if st.button("🧹 Limpar Painel e Processar Novo Lote"): 
                     limpar_sessao(); st.rerun()
@@ -704,6 +791,8 @@ elif st.session_state.view_mode == "Texto Livre":
     
     if "texto_anonimizado_resultado" not in st.session_state:
         st.session_state.texto_anonimizado_resultado = None
+    if "relatorio_texto_livre" not in st.session_state:
+        st.session_state.relatorio_texto_livre = None
 
     col1, col2 = st.columns(2)
     
@@ -717,9 +806,14 @@ elif st.session_state.view_mode == "Texto Livre":
         
         if btn_txt and texto_original:
             with st.spinner("Varrendo PIIs e aplicando DLP..."):
+                anonymizer.resetar_telemetria()
                 st.session_state.texto_anonimizado_resultado = anonymizer.process_raw_text(
                     texto_original, 
                     dicionario_regras
+                )
+                st.session_state.relatorio_texto_livre = anonymizer.gerar_relatorio_performance(
+                    salvar_arquivo=True, 
+                    contexto="Texto Livre"
                 )
 
     with col2:
@@ -745,6 +839,10 @@ elif st.session_state.view_mode == "Texto Livre":
             with col_clear:
                 if st.button("🧹 Limpar Resultado", use_container_width=True):
                     st.session_state.texto_anonimizado_resultado = None
+                    st.session_state.relatorio_texto_livre = None
                     st.rerun()
         else:
             st.info("Aguardando inserção e processamento de texto no painel à esquerda.")
+
+    if st.session_state.get("relatorio_texto_livre"):
+        render_painel_relatorio_performance(st.session_state.relatorio_texto_livre, "📊 Avaliação de Performance e Capacidade (Texto Livre)")

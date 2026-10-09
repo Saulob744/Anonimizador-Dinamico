@@ -96,7 +96,11 @@ htmlcov/
 *.log
 
 # ========================
-# ⚠️ TEMPORÁRIOS
+# ⚠️ TEMPORÁRIOS E RUNTIME
 # ========================
 *.tmp
 *.temp
+pipeline_progress*.json
+abort.flag
+resultado_lote.zip
+relatorios/

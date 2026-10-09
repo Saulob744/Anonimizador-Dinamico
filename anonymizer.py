@@ -1,4 +1,4 @@
-import os, re, random, string, unicodedata, hashlib, logging, requests, html, hmac, secrets, json
+import os, re, random, string, unicodedata, hashlib, logging, requests, html, hmac, secrets, json, time, threading
 from datetime import datetime
 from collections import Counter
 from functools import lru_cache
@@ -13,18 +13,60 @@ logger = logging.getLogger(__name__)
 
 SECRET_SALT = os.getenv("ANONYMIZER_SECRET_SALT", "SaltSeguroSESP2026_Producao!")
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/generate")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
 ABORT_FILE = "abort.flag"
 
-# Telemetria Global
-_TELEMETRIA = {
-    "inicio": datetime.now().isoformat(),
-    "celulas_avaliadas": 0, 
-    "celulas_alteradas": 0, 
-    "substituicoes_totais": 0, 
-    "identidades_protegidas": set(), 
-    "documentos_protegidos": set()
+# Telemetria Global e Auditoria
+_TELEMETRIA_LOCK = threading.Lock()
+
+def _novo_estado_telemetria():
+    return {
+        "t0": time.time(),
+        "inicio_iso": datetime.now().isoformat(),
+        "celulas_avaliadas": 0, 
+        "celulas_alteradas": 0, 
+        "substituicoes_totais": 0, 
+        "identidades_protegidas": set(), 
+        "documentos_protegidos": set(),
+        "amostras_auditoria": [],
+        "contadores": {
+            "PESSOAS": {"total": 0, "unicos": set(), "label": "👤 Pessoas / Nomes"},
+            "CPFS": {"total": 0, "unicos": set(), "label": "🪪 CPFs"},
+            "RGS": {"total": 0, "unicos": set(), "label": "📄 RGs"},
+            "TELEFONES": {"total": 0, "unicos": set(), "label": "📞 Telefones"},
+            "EMAILS": {"total": 0, "unicos": set(), "label": "✉️ E-mails"},
+            "CEPS": {"total": 0, "unicos": set(), "label": "📮 CEPs"},
+            "PLACAS": {"total": 0, "unicos": set(), "label": "🚗 Placas"},
+            "CHASSIS": {"total": 0, "unicos": set(), "label": "⚙️ Chassis"},
+            "IPS": {"total": 0, "unicos": set(), "label": "💻 Endereços IP"},
+            "COORDENADAS": {"total": 0, "unicos": set(), "label": "📍 Coordenadas Geográficas"},
+            "CODIGOS_GENERICOS": {"total": 0, "unicos": set(), "label": "🔢 Códigos / Identificadores"},
+            "OUTROS": {"total": 0, "unicos": set(), "label": "🛡️ Outros Dados Sensíveis"}
+        }
+    }
+
+_TELEMETRIA = _novo_estado_telemetria()
+
+CATEGORIA_MAP = {
+    "PER": "PESSOAS",
+    "NOME_SOLTO": "PESSOAS",
+    "CPF": "CPFS",
+    "RG": "RGS",
+    "PHONE": "TELEFONES",
+    "EMAIL": "EMAILS",
+    "CEP": "CEPS",
+    "PLATE": "PLACAS",
+    "PLACA": "PLACAS",
+    "CHASSI": "CHASSIS",
+    "IP": "IPS",
+    "COORD": "COORDENADAS",
+    "COORD_SINGLE": "COORDENADAS",
+    "GENERIC_CODE": "CODIGOS_GENERICOS"
 }
+
+def _mascarar_amostra(texto: str) -> str:
+    s = str(texto).strip()
+    if len(s) <= 4: return "****"
+    return f"{s[:2]}***{s[-2:]}"
 
 _COLUMN_POLICIES, _OLLAMA_CACHE = {}, {}
 fake = Faker("pt_BR")
@@ -38,6 +80,26 @@ except Exception as e:
 
 http_session = requests.Session()
 http_session.mount("http://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503, 504])))
+
+def _resolve_model_name():
+    target = os.getenv("OLLAMA_MODEL", "llama3.2:1b")
+    try:
+        base_url = OLLAMA_URL.rsplit('/', 1)[0] if '/api/' in OLLAMA_URL else OLLAMA_URL
+        tags_url = f"{base_url}/tags"
+        resp = http_session.get(tags_url, timeout=2)
+        if resp.status_code == 200:
+            models = [m.get("name", "") for m in resp.json().get("models", [])]
+            if any(target in m for m in models):
+                return target
+            if models:
+                first_model = models[0]
+                logger.info(f"💡 Modelo alvo '{target}' não instalado no Ollama. Utilizando modelo disponível: '{first_model}'")
+                return first_model
+    except Exception:
+        pass
+    return target
+
+OLLAMA_MODEL = _resolve_model_name()
 
 REGEX = {
     "CPF": re.compile(r"(?<!\d)(?:\d[-.\s_/*]{0,4}){10}\d(?!\d)"),
@@ -64,38 +126,115 @@ def _sanitize_input(text: str) -> str: return re.sub(r'[^\w\s\.,;:!?@\-\(\)]', '
 def _check_abort(): return os.path.exists(ABORT_FILE)
 def _clean_name(name_str: str) -> str: return re.sub(r"^[,.:\-]+|[,.:\-]+$", "", TITLES_TO_STRIP.sub("", name_str)).strip()
 
-def emitir_relatorio_auditoria():
-    fim = datetime.now()
-    ts_str = fim.strftime("%Y%m%d_%H%M%S")
-    nome_arquivo = f"relatorio_auditoria_{ts_str}.json"
+def _registrar_captura(typ: str, original_val: str, fake_val: str):
+    cat = CATEGORIA_MAP.get(str(typ).upper(), "OUTROS")
+    norm_val = _normalize(str(original_val))
     
-    relatorio_data = {
-        "inicio_processamento": _TELEMETRIA["inicio"],
-        "fim_processamento": fim.isoformat(),
-        "celulas_avaliadas": _TELEMETRIA["celulas_avaliadas"],
-        "celulas_alteradas": _TELEMETRIA["celulas_alteradas"],
-        "substituicoes_totais": _TELEMETRIA["substituicoes_totais"],
-        "total_identidades_protegidas": len(_TELEMETRIA["identidades_protegidas"]),
-        "total_documentos_protegidos": len(_TELEMETRIA["documentos_protegidos"]),
-        "amostra_identidades": list(_TELEMETRIA["identidades_protegidas"])[:50],
-        "amostra_documentos": list(_TELEMETRIA["documentos_protegidos"])[:50]
-    }
-    
-    try:
-        with open(nome_arquivo, "w", encoding="utf-8") as f:
-            json.dump(relatorio_data, f, indent=4, ensure_ascii=False)
-        logger.info(f"📄 Relatório de auditoria salvo em: {nome_arquivo}")
-    except Exception as e:
-        logger.error(f"🚨 Erro ao gerar arquivo de auditoria: {e}")
+    with _TELEMETRIA_LOCK:
+        if cat in _TELEMETRIA["contadores"]:
+            _TELEMETRIA["contadores"][cat]["total"] += 1
+            _TELEMETRIA["contadores"][cat]["unicos"].add(norm_val)
+        
+        if cat == "PESSOAS":
+            _TELEMETRIA["identidades_protegidas"].add(norm_val)
+        else:
+            _TELEMETRIA["documentos_protegidos"].add(norm_val)
+            
+        if len(_TELEMETRIA["amostras_auditoria"]) < 100:
+            _TELEMETRIA["amostras_auditoria"].append({
+                "categoria": cat,
+                "original_mascarado": _mascarar_amostra(original_val),
+                "substituto_gerado": fake_val
+            })
 
+def resetar_telemetria():
+    global _TELEMETRIA
+    with _TELEMETRIA_LOCK:
+        _TELEMETRIA = _novo_estado_telemetria()
+
+def gerar_relatorio_performance(salvar_arquivo=True, contexto="Geral", pasta_saida="relatorios") -> dict:
+    with _TELEMETRIA_LOCK:
+        fim_tempo = time.time()
+        tempo_total = max(fim_tempo - _TELEMETRIA["t0"], 0.001)
+        avaliadas = _TELEMETRIA["celulas_avaliadas"]
+        alteradas = _TELEMETRIA["celulas_alteradas"]
+        trocas = _TELEMETRIA["substituicoes_totais"]
+        
+        itens_por_seg = round(avaliadas / tempo_total, 1)
+        trocas_por_seg = round(trocas / tempo_total, 1)
+        taxa_sensibilidade = round((alteradas / max(avaliadas, 1)) * 100, 2)
+        
+        contadores_resumo = {}
+        for cat, dados in _TELEMETRIA["contadores"].items():
+            if dados["total"] > 0:
+                contadores_resumo[cat] = {
+                    "label": dados.get("label", cat),
+                    "total_capturado": dados["total"],
+                    "unicos_distintos": len(dados["unicos"])
+                }
+        
+        total_pessoas = contadores_resumo.get("PESSOAS", {}).get("total_capturado", 0)
+        total_pessoas_unicas = contadores_resumo.get("PESSOAS", {}).get("unicos_distintos", 0)
+        total_cpfs = contadores_resumo.get("CPFS", {}).get("total_capturado", 0)
+        total_cpfs_unicos = contadores_resumo.get("CPFS", {}).get("unicos_distintos", 0)
+        
+        tempo_formatado = f"{int(tempo_total // 60)}m {int(tempo_total % 60):02d}s" if tempo_total >= 60 else f"{tempo_total:.2f}s"
+        
+        relatorio = {
+            "metadados": {
+                "data_hora_inicio": _TELEMETRIA["inicio_iso"],
+                "data_hora_fim": datetime.now().isoformat(),
+                "tempo_total_segundos": round(tempo_total, 2),
+                "tempo_formatado": tempo_formatado,
+                "modelo_ia": OLLAMA_MODEL,
+                "contexto": contexto
+            },
+            "metricas_performance": {
+                "itens_avaliados": avaliadas,
+                "itens_alterados": alteradas,
+                "substituicoes_totais": trocas,
+                "itens_por_segundo": itens_por_seg,
+                "substituicoes_por_segundo": trocas_por_seg,
+                "taxa_sensibilidade_pct": taxa_sensibilidade
+            },
+            "resumo_rapido": {
+                "total_pessoas_protegidas": total_pessoas,
+                "pessoas_unicas": total_pessoas_unicas,
+                "total_cpfs_protegidos": total_cpfs,
+                "cpfs_unicos": total_cpfs_unicos
+            },
+            "entidades_detalhadas": contadores_resumo,
+            "amostras_auditoria": list(_TELEMETRIA["amostras_auditoria"])
+        }
+        
+        caminho_arquivo = None
+        if salvar_arquivo:
+            try:
+                os.makedirs(pasta_saida, exist_ok=True)
+                ts_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+                nome_arq = f"relatorio_auditoria_{contexto.lower().replace(' ', '_')}_{ts_str}.json"
+                caminho_arquivo = os.path.join(pasta_saida, nome_arq)
+                with open(caminho_arquivo, "w", encoding="utf-8") as f:
+                    json.dump(relatorio, f, indent=4, ensure_ascii=False)
+                relatorio["arquivo_gerado"] = caminho_arquivo
+                logger.info(f"📊 Relatório de telemetria e performance salvo em: {caminho_arquivo}")
+            except Exception as e:
+                logger.error(f"🚨 Falha ao salvar relatório de performance: {e}")
+                
+        return relatorio
+
+def emitir_relatorio_auditoria():
+    rel = gerar_relatorio_performance(salvar_arquivo=True, contexto="Auditoria")
     print("\n" + "="*70 + "\n🛡️  RELATÓRIO DE TELEMETRIA E AUDITORIA (DLP / LGPD) 🛡️\n" + "="*70)
-    print(f"📊 Células/Textos avaliados:       {relatorio_data['celulas_avaliadas']}")
-    print(f"🔴 Células/Textos alterados:       {relatorio_data['celulas_alteradas']}")
-    print(f"🔀 Total de substituições:         {relatorio_data['substituicoes_totais']}")
-    print(f"👤 Pessoas/Nomes mascarados:       {relatorio_data['total_identidades_protegidas']}")
-    print(f"📄 Documentos/Dados mascarados:    {relatorio_data['total_documentos_protegidos']}")
-    print(f"📁 Arquivo de Saída:              {nome_arquivo}")
+    print(f"📊 Células/Textos avaliados:       {rel['metricas_performance']['itens_avaliados']}")
+    print(f"🔴 Células/Textos alterados:       {rel['metricas_performance']['itens_alterados']}")
+    print(f"🔀 Total de substituições:         {rel['metricas_performance']['substituicoes_totais']}")
+    print(f"👤 Pessoas/Nomes mascarados:       {rel['resumo_rapido']['total_pessoas_protegidas']} (Únicos: {rel['resumo_rapido']['pessoas_unicas']})")
+    print(f"🪪 CPFs mascarados:                {rel['resumo_rapido']['total_cpfs_protegidos']} (Únicos: {rel['resumo_rapido']['cpfs_unicos']})")
+    print(f"⚡ Throughput:                     {rel['metricas_performance']['itens_por_segundo']} itens/s")
+    print(f"📁 Arquivo de Saída:              {rel.get('arquivo_gerado', 'N/A')}")
     print("="*70 + "\n")
+    return rel
 
 def _ask_llm_yes_no(prompt: str, cache_key: str, system_prompt: str = "") -> bool:
     if cache_key in _OLLAMA_CACHE: return _OLLAMA_CACHE[cache_key]
@@ -214,12 +353,16 @@ def _get_fake(value: str, typ: str, context_prefix: str = "") -> str:
     if typ == "CHASSI": return "".join(r.choices("ABCDEFGHJKLMNPRSTUVWXYZ0123456789", k=17))
     return fake.word().upper()
 
+TAG_PRIORITY = ["CPF", "EMAIL", "PHONE", "PLATE", "CHASSI", "COORD", "COORD_SINGLE", "CEP", "RG", "GENERIC_CODE", "IP"]
+TAG_RANK = {t: i for i, t in enumerate(["PER"] + TAG_PRIORITY)}
+
 def _detect_all(text: str, regras_mascara: dict):
     found, r_get = [], regras_mascara.get
-    tags = {t for t, k in [("CPF", "CPF"), ("RG", "RG"), ("CEP", "RG"), ("GENERIC_CODE", "RG"), ("EMAIL", "EMAIL"), ("IP", "IP"), ("PLATE", "PLATE"), ("CHASSI", "CHASSI"), ("PHONE", "PHONE"), ("COORD", "COORD"), ("COORD_SINGLE", "COORD")] if r_get(k, True)}
+    tags_enabled = {t for t, k in [("CPF", "CPF"), ("RG", "RG"), ("CEP", "RG"), ("GENERIC_CODE", "RG"), ("EMAIL", "EMAIL"), ("IP", "IP"), ("PLATE", "PLATE"), ("CHASSI", "CHASSI"), ("PHONE", "PHONE"), ("COORD", "COORD"), ("COORD_SINGLE", "COORD")] if r_get(k, True)}
+    ordered_tags = [t for t in TAG_PRIORITY if t in tags_enabled]
     ds = [m.span() for m in REGEX["DATE_TIME"].finditer(text)]
 
-    for typ in tags:
+    for typ in ordered_tags:
         found.extend((m.start(), m.end(), m.group(), typ) for m in REGEX[typ].finditer(text) if not any(max(m.start(), d[0]) < min(m.end(), d[1]) for d in ds))
     occ = [(i[0], i[1]) for i in found]
 
@@ -237,7 +380,7 @@ def _detect_all(text: str, regras_mascara: dict):
         for s, e, v in [(m.start(), m.end(), m.group()) for a in appr for m in re.finditer(re.escape(a), text, re.I)]:
             if not any(max(s, o[0]) < min(e, o[1]) for o in occ): found.append((s, e, v, "PER"))
 
-    return sorted(found, key=lambda x: (x[0], -(x[1] - x[0])))
+    return sorted(found, key=lambda x: (x[0], -(x[1] - x[0]), TAG_RANK.get(x[3], 99)))
 
 def anonymize_value(col_name: str, val, regras_mascara=None):
     try:
@@ -245,15 +388,19 @@ def anonymize_value(col_name: str, val, regras_mascara=None):
         text, r_mask = str(val), regras_mascara or {}
         if isinstance(r_mask, bool): r_mask = {"COORD": r_mask, "COORD_SINGLE": r_mask}
         
-        _TELEMETRIA["celulas_avaliadas"] += 1
+        with _TELEMETRIA_LOCK:
+            _TELEMETRIA["celulas_avaliadas"] += 1
+            
         pol = _COLUMN_POLICIES.get(col_name, "TEXTO_LIVRE")
         if pol == "IGNORAR" or (pol in ["COORD", "COORD_SINGLE"] and not r_mask.get("COORD", True)): return text, None
 
         if pol in ["NOME_SOLTO", "COORD", "COORD_SINGLE", "PLACA", "CPF", "RG", "CEP", "EMAIL", "PLATE", "PHONE", "IP", "CHASSI", "GENERIC_CODE"]:
             fake_v = _get_fake(text, pol)
             if fake_v != text:
-                _TELEMETRIA["celulas_alteradas"] += 1
-                _TELEMETRIA["substituicoes_totais"] += 1
+                with _TELEMETRIA_LOCK:
+                    _TELEMETRIA["celulas_alteradas"] += 1
+                    _TELEMETRIA["substituicoes_totais"] += 1
+                _registrar_captura(pol, text, fake_v)
                 if random.random() < 0.05:
                     logger.info(f"🔎 [TROCA DIRETA | {col_name}] '{text}' ➡️ '{fake_v}'")
             return fake_v, ("TEXT" if fake_v != text else None)
@@ -266,14 +413,18 @@ def anonymize_value(col_name: str, val, regras_mascara=None):
             for s, e, v, t in ents:
                 if s < last: continue
                 fake_v = _get_fake(v, t, text[max(0, s-20):s])
-                _TELEMETRIA["substituicoes_totais"] += 1
+                with _TELEMETRIA_LOCK:
+                    _TELEMETRIA["substituicoes_totais"] += 1
+                _registrar_captura(t, v, fake_v)
                 if random.random() < 0.20 or col_name == "RAW_TEXT_INJECTION":
                     logger.info(f"🔎 [TROCA NARRATIVA | {col_name}] '{v}' ➡️ '{fake_v}'")
                 res.extend([text[last:s], fake_v])
                 last = e
             res.append(text[last:])
             txt_fin = "".join(res)
-            if txt_fin != text: _TELEMETRIA["celulas_alteradas"] += 1
+            if txt_fin != text:
+                with _TELEMETRIA_LOCK:
+                    _TELEMETRIA["celulas_alteradas"] += 1
             return txt_fin, ("TEXT" if txt_fin != text else None)
         return text, None
     except Exception as e:
